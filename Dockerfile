@@ -6,6 +6,7 @@ RUN npm ci --omit=dev
 FROM node:22-alpine
 ENV NODE_ENV=production
 WORKDIR /app
+RUN apk add --no-cache curl
 COPY --from=dependencies /app/node_modules ./node_modules
 COPY package.json ./
 COPY src ./src
