@@ -1,6 +1,7 @@
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
+import { pathToFileURL } from 'node:url';
 import * as z from 'zod/v4';
 
 const PORT = Number.parseInt(process.env.PORT ?? '3000', 10);
@@ -195,6 +196,10 @@ app.use('/mcp', async (c, next) => {
 });
 app.all('/mcp', (c) => handler.fetch(c.req.raw));
 
-serve({ fetch: app.fetch, port: PORT, hostname: '0.0.0.0' }, () => {
-  console.log(`NEMDAR Coolify MCP extension listening on :${PORT}`);
-});
+export function start() {
+  return serve({ fetch: app.fetch, port: PORT, hostname: '0.0.0.0' }, () => {
+    console.log(`NEMDAR Coolify MCP extension listening on :${PORT}`);
+  });
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) start();
