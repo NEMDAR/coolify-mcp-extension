@@ -342,6 +342,21 @@ app.post('/oauth/token', async (c) => {
 });
 
 app.use('/mcp', async (c, next) => {
+  // ChatGPT scans tool definitions before the user completes OAuth. Permit only
+  // protocol initialization and schema discovery anonymously; every tool call
+  // remains protected by an OAuth access token.
+  if (c.req.method === 'POST') {
+    try {
+      const message = await c.req.raw.clone().json();
+      const publicMethods = new Set(['initialize', 'notifications/initialized', 'tools/list', 'ping']);
+      if (publicMethods.has(message?.method)) {
+        await next();
+        return;
+      }
+    } catch {
+      // Let the authenticated path return the appropriate response.
+    }
+  }
   const provided = extractBearer(c.req.header('authorization'));
   const token = verifyPayload(provided, 'access');
   if (!token) {
