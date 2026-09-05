@@ -2,12 +2,14 @@ import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
 import { pathToFileURL } from 'node:url';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import * as z from 'zod/v4';
 
 const PORT = Number.parseInt(process.env.PORT ?? '3000', 10);
 const COOLIFY_BASE_URL = normalizeBaseUrl(process.env.COOLIFY_BASE_URL ?? 'https://panel.nemdar.tech');
 const COOLIFY_API_TOKEN = process.env.COOLIFY_API_TOKEN;
 const MCP_API_KEY = process.env.MCP_API_KEY;
+const MCP_PUBLIC_URL = normalizeBaseUrl(process.env.MCP_PUBLIC_URL ?? 'https://coolify-mcp.nemdar.tech');
 
 if (!COOLIFY_API_TOKEN) throw new Error('COOLIFY_API_TOKEN is required');
 if (!MCP_API_KEY) throw new Error('MCP_API_KEY is required');
@@ -22,6 +24,47 @@ export function normalizeBaseUrl(value) {
 export function extractBearer(header) {
   const match = /^Bearer\s+(.+)$/i.exec(header ?? '');
   return match?.[1];
+}
+
+function base64url(value) {
+  return Buffer.from(value).toString('base64url');
+}
+
+function signPayload(payload) {
+  const encoded = base64url(JSON.stringify(payload));
+  const signature = createHmac('sha256', MCP_API_KEY).update(encoded).digest('base64url');
+  return `${encoded}.${signature}`;
+}
+
+function verifyPayload(value, expectedType) {
+  const [encoded, suppliedSignature, extra] = (value ?? '').split('.');
+  if (!encoded || !suppliedSignature || extra) return null;
+  const expectedSignature = createHmac('sha256', MCP_API_KEY).update(encoded).digest();
+  let supplied;
+  try { supplied = Buffer.from(suppliedSignature, 'base64url'); } catch { return null; }
+  if (supplied.length !== expectedSignature.length || !timingSafeEqual(supplied, expectedSignature)) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
+    if (payload.type !== expectedType || !Number.isFinite(payload.exp) || payload.exp < Math.floor(Date.now() / 1000)) return null;
+    return payload;
+  } catch { return null; }
+}
+
+function isAllowedRedirectUri(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && (url.hostname === 'chatgpt.com' || url.hostname.endsWith('.chatgpt.com'));
+  } catch { return false; }
+}
+
+function oauthError(c, status, error, description) {
+  return c.json({ error, error_description: description }, status);
+}
+
+function htmlEscape(value) {
+  return String(value).replace(/[&<>"']/g, (character) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  })[character]);
 }
 
 export function normalizeDomains(domains) {
@@ -189,9 +232,122 @@ const handler = createMcpHandler(buildServer);
 const app = new Hono();
 
 app.get('/health', (c) => c.json({ status: 'ok', service: 'nemdar-coolify-extension' }));
+
+const authorizationServerMetadata = {
+  issuer: MCP_PUBLIC_URL,
+  authorization_endpoint: `${MCP_PUBLIC_URL}/oauth/authorize`,
+  token_endpoint: `${MCP_PUBLIC_URL}/oauth/token`,
+  registration_endpoint: `${MCP_PUBLIC_URL}/oauth/register`,
+  response_types_supported: ['code'],
+  grant_types_supported: ['authorization_code'],
+  code_challenge_methods_supported: ['S256'],
+  token_endpoint_auth_methods_supported: ['none'],
+  scopes_supported: ['mcp']
+};
+
+app.get('/.well-known/oauth-authorization-server', (c) => c.json(authorizationServerMetadata));
+app.get('/.well-known/oauth-protected-resource', (c) => c.json({
+  resource: `${MCP_PUBLIC_URL}/mcp`,
+  authorization_servers: [MCP_PUBLIC_URL],
+  scopes_supported: ['mcp'],
+  bearer_methods_supported: ['header']
+}));
+app.get('/.well-known/oauth-protected-resource/mcp', (c) => c.json({
+  resource: `${MCP_PUBLIC_URL}/mcp`,
+  authorization_servers: [MCP_PUBLIC_URL],
+  scopes_supported: ['mcp'],
+  bearer_methods_supported: ['header']
+}));
+
+app.post('/oauth/register', async (c) => {
+  let body;
+  try { body = await c.req.json(); } catch { return oauthError(c, 400, 'invalid_client_metadata', 'Request body must be JSON'); }
+  const redirectUris = Array.isArray(body.redirect_uris) ? body.redirect_uris : [];
+  if (redirectUris.length === 0 || !redirectUris.every(isAllowedRedirectUri)) {
+    return oauthError(c, 400, 'invalid_redirect_uri', 'Only HTTPS chatgpt.com callback URLs are allowed');
+  }
+  const clientId = signPayload({
+    type: 'client',
+    redirect_uris: redirectUris,
+    iat: Math.floor(Date.now() / 1000),
+    exp: Math.floor(Date.now() / 1000) + 365 * 24 * 60 * 60,
+    nonce: randomBytes(12).toString('base64url')
+  });
+  return c.json({
+    client_id: clientId,
+    client_id_issued_at: Math.floor(Date.now() / 1000),
+    redirect_uris: redirectUris,
+    grant_types: ['authorization_code'],
+    response_types: ['code'],
+    token_endpoint_auth_method: 'none'
+  }, 201);
+});
+
+app.get('/oauth/authorize', (c) => {
+  const query = c.req.query();
+  const client = verifyPayload(query.client_id, 'client');
+  if (!client || !client.redirect_uris.includes(query.redirect_uri) || !isAllowedRedirectUri(query.redirect_uri)) {
+    return oauthError(c, 400, 'invalid_request', 'Invalid client or redirect URI');
+  }
+  if (query.response_type !== 'code' || query.code_challenge_method !== 'S256' || !query.code_challenge) {
+    return oauthError(c, 400, 'invalid_request', 'Authorization code flow with PKCE S256 is required');
+  }
+  const hidden = ['client_id', 'redirect_uri', 'state', 'code_challenge', 'code_challenge_method', 'scope', 'resource']
+    .map((name) => `<input type="hidden" name="${name}" value="${htmlEscape(query[name] ?? '')}">`).join('');
+  return c.html(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>NEMDAR Coolify Admin</title><style>body{font:16px system-ui;background:#0b0b0c;color:#fff;display:grid;place-items:center;min-height:100vh;margin:0}.card{width:min(420px,88vw);padding:28px;border:1px solid #333;border-radius:16px;background:#151517}input,button{box-sizing:border-box;width:100%;padding:13px;margin-top:12px;border-radius:9px;border:1px solid #444;background:#222;color:#fff}button{background:#6d28d9;border:0;font-weight:700;cursor:pointer}small{color:#aaa}</style></head><body><form class="card" method="post" action="/oauth/authorize"><h2>NEMDAR Coolify Admin</h2><p>Authorize ChatGPT to manage NEMDAR Coolify applications.</p>${hidden}<label>Admin access key<input type="password" name="access_key" required autocomplete="current-password"></label><button type="submit">Authorize</button><p><small>Use the MCP_API_KEY configured in Coolify.</small></p></form></body></html>`);
+});
+
+app.post('/oauth/authorize', async (c) => {
+  const form = await c.req.parseBody();
+  const client = verifyPayload(form.client_id, 'client');
+  if (!client || !client.redirect_uris.includes(form.redirect_uri) || !isAllowedRedirectUri(form.redirect_uri)) {
+    return oauthError(c, 400, 'invalid_request', 'Invalid client or redirect URI');
+  }
+  const provided = Buffer.from(String(form.access_key ?? ''));
+  const expected = Buffer.from(MCP_API_KEY);
+  if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) {
+    return c.html('<h1>Authorization denied</h1><p>The admin access key is incorrect.</p>', 401);
+  }
+  if (form.code_challenge_method !== 'S256' || !form.code_challenge) {
+    return oauthError(c, 400, 'invalid_request', 'PKCE S256 is required');
+  }
+  const code = signPayload({
+    type: 'code', client_id: form.client_id, redirect_uri: form.redirect_uri,
+    code_challenge: form.code_challenge, scope: form.scope || 'mcp',
+    resource: form.resource || `${MCP_PUBLIC_URL}/mcp`,
+    exp: Math.floor(Date.now() / 1000) + 300,
+    nonce: randomBytes(16).toString('base64url')
+  });
+  const redirect = new URL(String(form.redirect_uri));
+  redirect.searchParams.set('code', code);
+  if (form.state) redirect.searchParams.set('state', String(form.state));
+  return c.redirect(redirect.toString(), 302);
+});
+
+app.post('/oauth/token', async (c) => {
+  const form = await c.req.parseBody();
+  if (form.grant_type !== 'authorization_code') return oauthError(c, 400, 'unsupported_grant_type', 'Only authorization_code is supported');
+  const code = verifyPayload(form.code, 'code');
+  if (!code || code.client_id !== form.client_id || code.redirect_uri !== form.redirect_uri) {
+    return oauthError(c, 400, 'invalid_grant', 'Invalid or expired authorization code');
+  }
+  const challenge = createHash('sha256').update(String(form.code_verifier ?? '')).digest('base64url');
+  if (!form.code_verifier || challenge !== code.code_challenge) return oauthError(c, 400, 'invalid_grant', 'PKCE verification failed');
+  const accessToken = signPayload({
+    type: 'access', scope: code.scope || 'mcp', resource: code.resource,
+    exp: Math.floor(Date.now() / 1000) + 8 * 60 * 60,
+    nonce: randomBytes(16).toString('base64url')
+  });
+  return c.json({ access_token: accessToken, token_type: 'Bearer', expires_in: 8 * 60 * 60, scope: code.scope || 'mcp' });
+});
+
 app.use('/mcp', async (c, next) => {
   const provided = extractBearer(c.req.header('authorization'));
-  if (!provided || provided !== MCP_API_KEY) return c.json({ error: 'Unauthorized' }, 401);
+  const token = verifyPayload(provided, 'access');
+  if (!token) {
+    c.header('WWW-Authenticate', `Bearer resource_metadata="${MCP_PUBLIC_URL}/.well-known/oauth-protected-resource/mcp"`);
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
   await next();
 });
 app.all('/mcp', (c) => handler.fetch(c.req.raw));
